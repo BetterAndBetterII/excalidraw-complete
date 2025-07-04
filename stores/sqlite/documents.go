@@ -20,15 +20,40 @@ type documentStore struct {
 	db *sql.DB
 }
 
-func NewDocumentStore(dataSourceName string) core.DocumentStore {
-	// db, err := sql.Open("sqlite3", ":memory:")
-	db, err := sql.Open("sqlite3", dataSourceName)
+// Store集合结构，包含所有存储组件
+type Store struct {
+	DB           *sql.DB
+	Documents    core.DocumentStore
+	Users        core.UserStore
+	Canvas       core.CanvasStore
+	Sessions     core.SessionStore
+}
 
+// 创建新的Store实例
+func NewStore(dataSourceName string) *Store {
+	db, err := sql.Open("sqlite3", dataSourceName)
 	if err != nil {
 		log.Fatal(err)
 	}
+	
+	// 启用外键约束
+	_, err = db.Exec("PRAGMA foreign_keys = ON")
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	return &Store{
+		DB:           db,
+		Documents:    NewDocumentStore(db),
+		Users:        NewUserStore(db),
+		Canvas:       NewCanvasStore(db),
+		Sessions:     NewSessionStore(db),
+	}
+}
+
+func NewDocumentStore(db *sql.DB) core.DocumentStore {
 	sts := `CREATE TABLE IF NOT EXISTS documents (id TEXT PRIMARY KEY, data BLOB);`
-	_, err = db.Exec(sts)
+	_, err := db.Exec(sts)
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -4,8 +4,10 @@ import (
 	"embed"
 	_ "embed"
 	"excalidraw-complete/core"
+	"excalidraw-complete/handlers/api/canvas"
 	"excalidraw-complete/handlers/api/documents"
 	"excalidraw-complete/handlers/api/firebase"
+	"excalidraw-complete/handlers/auth"
 	"excalidraw-complete/stores"
 	"flag"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -103,7 +106,7 @@ func handleUI() http.Handler {
 	})
 }
 
-func setupRouter(documentStore core.DocumentStore) *chi.Mux {
+func setupRouter(store stores.Store) *chi.Mux {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 
@@ -115,19 +118,34 @@ func setupRouter(documentStore core.DocumentStore) *chi.Mux {
 		MaxAge:           300, // Maximum value not ignored by any of major browsers
 	}))
 
+	// 添加认证中间件
+	r.Use(auth.AuthMiddleware(store))
+
+	// 认证路由
+	authHandler := auth.NewAuthHandler(store)
+	r.Mount("/auth", authHandler.Routes())
+
+	// 画布API路由
+	canvasHandler := canvas.NewCanvasHandler(store)
+	r.Mount("/api/canvas", canvasHandler.Routes())
+
+	// 保持现有的Firebase兼容性路由
 	r.Route("/v1/projects/{project_id}/databases/{database_id}", func(r chi.Router) {
 		r.Post("/documents:commit", firebase.HandleBatchCommit())
 		r.Post("/documents:batchGet", firebase.HandleBatchGet())
 	})
 
+	// 保持现有的文档API路由
 	r.Route("/api/v2", func(r chi.Router) {
-		r.Post("/post/", documents.HandleCreate(documentStore))
+		r.Post("/post/", documents.HandleCreate(store.GetDocumentStore()))
 		r.Route("/{id}", func(r chi.Router) {
-			r.Get("/", documents.HandleGet(documentStore))
+			r.Get("/", documents.HandleGet(store.GetDocumentStore()))
 		})
 	})
+
 	return r
 }
+
 func setupSocketIO() *socketio.Server {
 	opts := socketio.DefaultServerOptions()
 	opts.SetMaxHttpBufferSize(5000000)
@@ -218,6 +236,24 @@ func setupSocketIO() *socketio.Server {
 
 }
 
+// 定期清理过期会话
+func startSessionCleanup(store stores.Store) {
+	ticker := time.NewTicker(1 * time.Hour) // 每小时运行一次
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				err := store.GetSessionStore().CleanExpiredSessions(nil)
+				if err != nil {
+					logrus.WithError(err).Error("Failed to clean expired sessions")
+				} else {
+					logrus.Debug("Session cleanup completed")
+				}
+			}
+		}
+	}()
+}
+
 func waitForShutdown(ioo *socketio.Server) {
 	exit := make(chan struct{})
 	SignalC := make(chan os.Signal)
@@ -244,7 +280,7 @@ func waitForShutdown(ioo *socketio.Server) {
 func main() {
 	// Define a log level flag
 	logLevel := flag.String("loglevel", "info", "Set the logging level: debug, info, warn, error, fatal, panic")
-    listenAddr := flag.String("listen", ":3002", "Set the server listen address")
+	listenAddr := flag.String("listen", ":3002", "Set the server listen address")
 	flag.Parse()
 
 	// Set the log level
@@ -255,8 +291,14 @@ func main() {
 	}
 	logrus.SetLevel(level)
 
-	documentStore := stores.GetStore() // Make sure this is well-defined in your "stores" package
-	r := setupRouter(documentStore)
+	// 检查OAuth配置
+	if os.Getenv("GITHUB_CLIENT_ID") == "" || os.Getenv("GITHUB_CLIENT_SECRET") == "" {
+		logrus.Warn("GitHub OAuth is not configured. Please set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET environment variables to enable user authentication.")
+	}
+
+	// 初始化存储
+	store := stores.GetStore()
+	r := setupRouter(store)
 	ioo := setupSocketIO()
 	r.Handle("/socket.io/", ioo.ServeHandler(nil))
 	r.Get("/ping", func(w http.ResponseWriter, _ *http.Request) {
@@ -267,6 +309,9 @@ func main() {
 	})
 	r.Mount("/", handleUI())
 
+	// 启动会话清理
+	startSessionCleanup(store)
+
 	logrus.WithField("addr", *listenAddr).Info("starting server")
 	go func() {
 		if err := http.ListenAndServe(*listenAddr, r); err != nil {
@@ -276,5 +321,4 @@ func main() {
 
 	logrus.Debug("Server is running in the background")
 	waitForShutdown(ioo)
-
 }
